@@ -1,10 +1,10 @@
 -- PathV2 low-ground FORCE edition. Same spring movement; absolute floor-based height.
 -- No HTTP requests here. Load once, then PathV2.Go(TweenV2, character, goal, options).
--- Ground paths only: jump/climb/custom-link traversal is intentionally disabled.
+-- Force on ground; native Humanoid jumps and truss climbing during traversal.
 local PathfindingService = game:GetService("PathfindingService")
 local RunService = game:GetService("RunService")
 local Workspace = game:GetService("Workspace")
-local PathV2 = { Version = "3.0.1-low-force" }
+local PathV2 = { Version = "3.1.0-force-traversal" }
 local registryHost = type(shared) == "table" and shared or _G
 local registry = rawget(registryHost, "__PathV2LowForceRuntimeV1")
 if type(registry) ~= "table" or type(registry.Routes) ~= "table" then
@@ -44,9 +44,12 @@ function PathV2.Go(TweenV2, character, goal, options)
 		MaxCandidates = 2, MinComputeInterval = 1,
 		MaxGroundGap = 1, MaxGroundRise = 0.75,
 		WaypointTolerance = 0.15, FinalTolerance = 0.05,
+		TraversalSpeed = 16, TraversalTimeout = 30, TraversalStuckTime = 5,
+		TraversalTolerance = 1, LandingTimeout = 5,
 	}
-	local optional = { GoalPart = true, Owner = true, Ignore = true, Costs = true, TweenOptions = true }
+	local optional = { GoalPart = true, Owner = true, Ignore = true, Costs = true, TweenOptions = true, AllowJump = true, AllowClimb = true }
 	local o = table.clone(defaults)
+	o.AllowJump, o.AllowClimb = true, true
 	for key, value in pairs(options or {}) do
 		assert(defaults[key] ~= nil or optional[key], "PathV2: unknown option " .. tostring(key))
 		o[key] = value
@@ -60,6 +63,8 @@ function PathV2.Go(TweenV2, character, goal, options)
 	assert(o.GroundClearance <= 0.25, "PathV2 low-force: GroundClearance must be <= 0.25")
 	assert(o.MaxCandidates >= 1 and o.MaxCandidates <= 8 and o.MaxCandidates % 1 == 0 and o.MinComputeInterval >= 0.5, "PathV2: invalid compute limits")
 	assert(o.MaxReplans % 1 == 0, "PathV2: MaxReplans must be an integer")
+	assert(type(o.AllowJump) == "boolean" and type(o.AllowClimb) == "boolean", "PathV2: AllowJump/AllowClimb must be booleans")
+	assert(o.TraversalSpeed > 0 and o.TraversalTimeout > 0 and o.TraversalStuckTime > 0 and o.TraversalTolerance > 0 and o.LandingTimeout > 0, "PathV2: invalid traversal settings")
 	assert(o.GoalPart == nil or (typeof(o.GoalPart) == "Instance" and o.GoalPart:IsA("BasePart")), "PathV2: GoalPart must be a BasePart")
 	assert(o.Owner == nil or typeof(o.Owner) == "Instance", "PathV2: Owner must be an Instance")
 	local tuning = { Frequency = 0.2, Damping = 1, MaxForce = 100000, VelocityTolerance = 0.1, SettleTime = 0.1 }
@@ -133,15 +138,21 @@ function PathV2.Go(TweenV2, character, goal, options)
 	end
 
 	local finished = Instance.new("BindableEvent")
-	local route = { Status = "Idle", Completed = finished.Event, Replans = 0, WaypointIndex = 0, Computations = 0 }
+	local route = { Status = "Idle", Completed = finished.Event, Replans = 0, WaypointIndex = 0, Computations = 0, Attempts = {} }
 	local connections, pathConnection, pathObject, pendingPath = {}, nil, nil, nil
 	local needsReplan, revision, oldRotate, ownsHumanoid = false, 0, nil, false
+	local nativeRestore
 	local function disposePath()
 		if pathConnection then pathConnection:Disconnect(); pathConnection = nil end
 		if pathObject then pathObject:Destroy(); pathObject = nil end
 		if pendingPath then pendingPath:Destroy(); pendingPath = nil end
 	end
 	local function stopMotion()
+		if nativeRestore then
+			local restore = nativeRestore
+			nativeRestore = nil
+			restore()
+		end
 		if route.Parking then
 			route.Parking:Cancel("PathV2Replan")
 			route.Parking = nil
@@ -212,6 +223,27 @@ function PathV2.Go(TweenV2, character, goal, options)
 		end
 		return Vector3.new(point.X, targetY, point.Z)
 	end
+	local function onGround()
+		-- Physics state can report FloorMaterial=Air while the feet touch ground.
+		-- Require a nearby support AND low vertical speed before resuming Force.
+		local hit = Workspace:Raycast(root.Position, Vector3.new(0, -(footHeight + 0.4), 0), cast)
+		return hit ~= nil and hit.Normal.Y >= 0.5
+			and math.abs(root.AssemblyLinearVelocity.Y) <= 2
+			and humanoid:GetState() ~= Enum.HumanoidStateType.Climbing
+	end
+	local function settleOnGround()
+		if onGround() then return true end
+		stopMotion()
+		humanoid:ChangeState(Enum.HumanoidStateType.Freefall)
+		local deadline = os.clock() + o.LandingTimeout
+		while alive() and os.clock() < deadline do
+			RunService.Heartbeat:Wait()
+			if not alive() then return false end
+			if onGround() then return true end
+		end
+		if not route.Result then finish("Failed", "LandingTimeout") end
+		return false
+	end
 	local function park()
 		if route.Parking then return end
 		local config = table.clone(tuning)
@@ -236,7 +268,9 @@ function PathV2.Go(TweenV2, character, goal, options)
 			local extent = part.Size / 2 + Vector3.new(o.AgentRadius + o.ApproachMargin, 0, o.AgentRadius + o.ApproachMargin)
 			for _, direction in ipairs({ Vector3.new(1, 0, 0), Vector3.new(-1, 0, 0), Vector3.new(0, 0, 1), Vector3.new(0, 0, -1), Vector3.new(1, 0, 1), Vector3.new(-1, 0, 1), Vector3.new(1, 0, -1), Vector3.new(-1, 0, -1) }) do
 				local point = part.CFrame:PointToWorldSpace(Vector3.new(direction.X * extent.X, 0, direction.Z * extent.Z))
-				add(Vector3.new(point.X, math.max(point.Y, root.Position.Y), point.Z))
+				-- Sample at the safe's elevation. Starting from a higher player
+				-- floor can otherwise select a roof above a lower-floor safe.
+				add(point)
 			end
 		else
 			add(goal)
@@ -257,12 +291,14 @@ function PathV2.Go(TweenV2, character, goal, options)
 				if os.clock() - waitingSince > 10 then finish("Failed", "PathfindingBusy"); return nil, nil, "PathfindingBusy" end
 				RunService.Heartbeat:Wait()
 			end
-			local path = PathfindingService:CreatePath({ AgentRadius = math.ceil(o.AgentRadius), AgentHeight = math.ceil(o.AgentHeight), AgentCanJump = false, AgentCanClimb = false, WaypointSpacing = o.WaypointSpacing, Costs = o.Costs or {} })
+			local path = PathfindingService:CreatePath({ AgentRadius = math.ceil(o.AgentRadius), AgentHeight = math.ceil(o.AgentHeight), AgentCanJump = o.AllowJump, AgentCanClimb = o.AllowClimb, WaypointSpacing = o.WaypointSpacing, Costs = o.Costs or {} })
 			pendingPath = path
 			registry.ComputeOwner = route
 			registry.NextComputeAt = os.clock() + o.MinComputeInterval
 			route.Computations = route.Computations + 1
-			local ok, err = pcall(function() path:ComputeAsync(root.Position, candidate.Floor) end)
+			local startPosition = root.Position
+			-- Both endpoints represent the character's root above the floor.
+			local ok, err = pcall(function() path:ComputeAsync(startPosition, candidate.Stand) end)
 			if registry.ComputeOwner == route then registry.ComputeOwner = nil end
 			if not alive() or revision ~= expectedRevision then path:Destroy(); pendingPath = nil; return nil, nil, "Interrupted" end
 			if ok and path.Status == Enum.PathStatus.Success then
@@ -272,28 +308,125 @@ function PathV2.Go(TweenV2, character, goal, options)
 				if #waypoints == 0 then valid = false; why = "EmptyWaypoints" end
 				for index, waypoint in ipairs(waypoints) do
 					local prefix = "Waypoint" .. tostring(index) .. ":"
-					if waypoint.Action ~= Enum.PathWaypointAction.Walk then
+					local jump = waypoint.Action == Enum.PathWaypointAction.Jump
+					local climb = waypoint.Label == "Climb"
+					local climbApproach = waypoints[index + 1] and waypoints[index + 1].Label == "Climb"
+					if (waypoint.Action ~= Enum.PathWaypointAction.Walk and not jump)
+						or (jump and not o.AllowJump) or (climb and not o.AllowClimb) then
 						valid = false; why = prefix .. "UnsupportedAction:" .. waypoint.Action.Name; break
 					end
-					-- Project onto the actual surface before adding the root-to-feet
-					-- offset; navmesh waypoint Y is not assumed to be exact floor Y.
-					local floor = groundBelow(waypoint.Position)
-					if not floor then valid = false; why = prefix .. "GroundMissing"; break end
-					local point = standingAt(floor)
-					local clear, reason = clearSegment(previous, point)
-					if not clear then valid = false; why = prefix .. reason; break end
-					table.insert(steps, { Position = point, PathIndex = index })
+					local previousStep = steps[#steps]
+					local transition = jump or climb or climbApproach or (previousStep and previousStep.Native)
+					-- Climb points describe height on the truss, not floor beneath it.
+					local floor = not (climb or jump) and groundBelow(waypoint.Position) or nil
+					if not floor and not transition then valid = false; why = prefix .. "GroundMissing"; break end
+					local point = floor and standingAt(floor) or standingAt(waypoint.Position)
+					-- Straight ground sweeps reject valid jump arcs and truss contact.
+					-- Those edges use native collision response, with progress/deadline checks.
+					if not transition then
+						local clear, reason = clearSegment(previous, point)
+						if not clear then valid = false; why = prefix .. reason; break end
+					end
+					table.insert(steps, { Position = point, RawPosition = waypoint.Position, PathIndex = index, Jump = jump, Climb = climb, Native = jump or climb or climbApproach })
 					previous = point
 				end
 				-- Finish at reachable ground beside GoalPart. No rise/cross/docking phase.
 				if valid then pendingPath = nil; return path, steps end
 			else
-				why = ok and "NoPath" or tostring(err)
+				why = ok and ("PlannerStatus:" .. path.Status.Name) or ("ComputeError:" .. tostring(err))
 			end
+			-- Keep recent failures so the caller can show what was actually tried.
+			table.insert(route.Attempts, {
+				From = startPosition, To = candidate.Stand, Reason = why,
+				AgentRadius = math.ceil(o.AgentRadius), AgentHeight = math.ceil(o.AgentHeight),
+				AllowJump = o.AllowJump, AllowClimb = o.AllowClimb,
+			})
+			if #route.Attempts > 32 then table.remove(route.Attempts, 1) end
 			path:Destroy()
 			pendingPath = nil
 		end
 		return nil, nil, why
+	end
+
+	local function traverse(steps, firstIndex)
+		stopMotion() -- Remove gravity compensation before any jump or climb.
+		local previousSpeed = humanoid.WalkSpeed
+		local previousJump = humanoid.Jump
+		nativeRestore = function()
+			if humanoid.Parent then
+				humanoid:Move(Vector3.zero, false)
+				humanoid.Jump = previousJump
+				humanoid.WalkSpeed = previousSpeed
+				humanoid.AutoRotate = false
+			end
+		end
+		humanoid.WalkSpeed = o.TraversalSpeed
+		humanoid.AutoRotate = true
+		humanoid:ChangeState(Enum.HumanoidStateType.Running)
+		local deadline = os.clock() + o.TraversalTimeout
+		local index, enteredIndex = firstIndex, nil
+		local jumpIssued, sawAir, jumpAt = false, false, 0
+		local bestDistance, lastProgress = math.huge, os.clock()
+		while alive() and not needsReplan do
+			local step = steps[index]
+			route.WaypointIndex = step.PathIndex
+			route.Status = step.Climb and "Climbing" or (step.Jump and "Jumping" or "Traversing")
+			local now = os.clock()
+			if now >= deadline then finish("Failed", "TraversalTimeout"); return nil end
+			if enteredIndex ~= index then
+				enteredIndex = index
+				jumpIssued, sawAir = false, false
+				bestDistance, lastProgress = math.huge, now
+				if step.Climb and not humanoid:GetStateEnabled(Enum.HumanoidStateType.Climbing) then
+					finish("Failed", "ClimbingStateDisabled"); return nil
+				end
+			end
+			local grounded = onGround()
+			if step.Jump and not jumpIssued and grounded then
+				if not humanoid:GetStateEnabled(Enum.HumanoidStateType.Jumping) then
+					finish("Failed", "JumpingStateDisabled"); return nil
+				end
+				jumpIssued, jumpAt = true, now
+				humanoid.Jump = true
+				humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+			end
+			if jumpIssued and not grounded then sawAir = true end
+			if jumpIssued and not sawAir and now - jumpAt > 1.5 then
+				finish("Failed", "JumpDidNotLaunch"); return nil
+			end
+			local target = step.Climb and step.RawPosition or step.Position
+			local difference = target - root.Position
+			local horizontal = Vector3.new(difference.X, 0, difference.Z)
+			local distance = step.Climb and difference.Magnitude or horizontal.Magnitude
+			if bestDistance - distance >= o.MinProgress then bestDistance, lastProgress = distance, now end
+			-- Native climbing requires actual truss contact; changing state alone
+			-- cannot make an arbitrary wall climbable. Collisions remain enabled.
+			local direction = step.Climb and difference or horizontal
+			if direction.Magnitude > 1 then direction = direction.Unit end
+			humanoid:Move(direction, false)
+			local reached = distance <= o.TraversalTolerance
+			if not step.Climb then reached = reached and math.abs(difference.Y) <= footHeight + 2 end
+			if step.Jump then reached = reached and jumpIssued and sawAir end
+			if reached then
+				local nextIsClimb = steps[index + 1] and steps[index + 1].Climb
+				if grounded and not step.Climb and not nextIsClimb then
+					stopMotion()
+					root.AssemblyLinearVelocity = Vector3.zero
+					root.AssemblyAngularVelocity = Vector3.zero
+					humanoid:ChangeState(Enum.HumanoidStateType.Physics)
+					route.Status = "Moving"
+					-- Revisit this landing point with Force for precise arrival.
+					return index
+				elseif index < #steps then
+					index = index + 1
+				end
+			elseif now - lastProgress >= o.TraversalStuckTime then
+				finish("Failed", "TraversalBlocked:Waypoint" .. tostring(step.PathIndex)); return nil
+			end
+			RunService.Heartbeat:Wait()
+		end
+		-- Repath/cancel already removes native control through stopMotion().
+		return nil
 	end
 
 	local function follow(point, isFinal)
@@ -360,6 +493,8 @@ function PathV2.Go(TweenV2, character, goal, options)
 			while alive() do
 				needsReplan = false
 				disposePath()
+				if not settleOnGround() then return end
+				humanoid:ChangeState(Enum.HumanoidStateType.Physics)
 				park()
 				route.Status = "Planning"
 				local expectedRevision = revision
@@ -373,10 +508,19 @@ function PathV2.Go(TweenV2, character, goal, options)
 					end)
 					route.Status = "Moving"
 					local completed = true
-					for index, waypoint in ipairs(steps) do
+					local index = 1
+					while index <= #steps do
 						if not alive() or needsReplan then completed = false; break end
+						local waypoint = steps[index]
 						route.WaypointIndex = waypoint.PathIndex
+						if waypoint.Native then
+							local landedIndex = traverse(steps, index)
+							if not landedIndex then completed = false; break end
+							index = landedIndex
+							waypoint = steps[index]
+						end
 						if not follow(waypoint.Position, index == #steps) then completed = false; break end
+						index = index + 1
 					end
 					if completed and alive() then finish("Completed"); return end
 				elseif path then
@@ -388,6 +532,8 @@ function PathV2.Go(TweenV2, character, goal, options)
 				route.Status = "WaitingForPath"
 				route.Detail = why or route.Detail or "Replanning"
 				if o.MaxReplans > 0 and route.Replans > o.MaxReplans then finish("NoPath", route.Detail); return end
+				if not settleOnGround() then return end
+				humanoid:ChangeState(Enum.HumanoidStateType.Physics)
 				park()
 				waitRetry()
 			end
