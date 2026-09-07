@@ -4,7 +4,7 @@
 local PathfindingService = game:GetService("PathfindingService")
 local RunService = game:GetService("RunService")
 local Workspace = game:GetService("Workspace")
-local PathV2 = { Version = "3.0.0-low-force" }
+local PathV2 = { Version = "3.0.1-low-force" }
 local registryHost = type(shared) == "table" and shared or _G
 local registry = rawget(registryHost, "__PathV2LowForceRuntimeV1")
 if type(registry) ~= "table" or type(registry.Routes) ~= "table" then
@@ -88,14 +88,40 @@ function PathV2.Go(TweenV2, character, goal, options)
 	overlap.CollisionGroup = root.CollisionGroup
 	overlap.MaxParts = 1
 
+	local bodyProbe
 	local function occupied(position)
-		return #Workspace:GetPartBoundsInBox(CFrame.new(position + bodyOffset), bodySize, overlap) > 0
+		local frame = CFrame.new(position + bodyOffset)
+		-- Bounds are only a cheap first pass: hollow/irregular meshes need a
+		-- collision-geometry overlap before we reject this position.
+		if #Workspace:GetPartBoundsInBox(frame, bodySize, overlap) == 0 then return nil end
+		if not bodyProbe then
+			bodyProbe = Instance.new("Part")
+			bodyProbe.Name = "PathV2ClearanceProbe"
+			bodyProbe.Anchored = true
+			bodyProbe.CanCollide = false
+			bodyProbe.CanTouch = false
+			bodyProbe.CanQuery = false
+			bodyProbe.Transparency = 1
+			bodyProbe.Size = bodySize
+			table.insert(ignore, bodyProbe)
+			cast.FilterDescendantsInstances = ignore
+			overlap.FilterDescendantsInstances = ignore
+			bodyProbe.CFrame = frame
+			bodyProbe.Parent = Workspace
+		end
+		bodyProbe.CFrame = frame
+		return Workspace:GetPartsInPart(bodyProbe, overlap)[1]
 	end
 	local function clearSegment(a, b)
-		if occupied(a) or occupied(b) then return false end
+		local obstacle = occupied(a)
+		if obstacle then return false, "StartOverlap:" .. obstacle:GetFullName() end
+		obstacle = occupied(b)
+		if obstacle then return false, "EndOverlap:" .. obstacle:GetFullName() end
 		local direction = b - a
 		if direction.Magnitude <= 0.001 then return true end
-		return Workspace:Blockcast(CFrame.new(a + bodyOffset), bodySize, direction, cast) == nil
+		local hit = Workspace:Blockcast(CFrame.new(a + bodyOffset), bodySize, direction, cast)
+		if hit then return false, "SweepBlocked:" .. hit.Instance:GetFullName() end
+		return true
 	end
 	local function groundBelow(position)
 		local hit = Workspace:Raycast(position + Vector3.new(0, o.ProbeHeight, 0), Vector3.new(0, -o.ProbeDepth, 0), cast)
@@ -130,6 +156,7 @@ function PathV2.Go(TweenV2, character, goal, options)
 		route.Result, route.Status, route.Detail = status, status, detail
 		stopMotion()
 		disposePath()
+		if bodyProbe then bodyProbe:Destroy(); bodyProbe = nil end
 		for _, connection in ipairs(connections) do connection:Disconnect() end
 		table.clear(connections)
 		if active[character] == route then active[character] = nil end
@@ -242,17 +269,24 @@ function PathV2.Go(TweenV2, character, goal, options)
 				local steps, valid = {}, true
 				local previous = root.Position
 				local waypoints = path:GetWaypoints()
-				if #waypoints == 0 then valid = false end
+				if #waypoints == 0 then valid = false; why = "EmptyWaypoints" end
 				for index, waypoint in ipairs(waypoints) do
-					-- Lift ground waypoints only for clearance checks, not the force Y target.
-					local point = standingAt(waypoint.Position)
-					if waypoint.Action ~= Enum.PathWaypointAction.Walk or not clearSegment(previous, point) then valid = false; break end
+					local prefix = "Waypoint" .. tostring(index) .. ":"
+					if waypoint.Action ~= Enum.PathWaypointAction.Walk then
+						valid = false; why = prefix .. "UnsupportedAction:" .. waypoint.Action.Name; break
+					end
+					-- Project onto the actual surface before adding the root-to-feet
+					-- offset; navmesh waypoint Y is not assumed to be exact floor Y.
+					local floor = groundBelow(waypoint.Position)
+					if not floor then valid = false; why = prefix .. "GroundMissing"; break end
+					local point = standingAt(floor)
+					local clear, reason = clearSegment(previous, point)
+					if not clear then valid = false; why = prefix .. reason; break end
 					table.insert(steps, { Position = point, PathIndex = index })
 					previous = point
 				end
 				-- Finish at reachable ground beside GoalPart. No rise/cross/docking phase.
 				if valid then pendingPath = nil; return path, steps end
-				why = "BodyClearanceOrUnsupportedLink"
 			else
 				why = ok and "NoPath" or tostring(err)
 			end
@@ -263,7 +297,8 @@ function PathV2.Go(TweenV2, character, goal, options)
 	end
 
 	local function follow(point, isFinal)
-		if not clearSegment(root.Position, point) then route:Repath("Obstacle"); return false end
+		local clear, reason = clearSegment(root.Position, point)
+		if not clear then route:Repath("Waypoint" .. tostring(route.WaypointIndex) .. ":" .. reason); return false end
 		local config = table.clone(tuning)
 		config.Mode, config.GravityScale, config.Timeout = "Force", 0, 0
 		config.PositionTolerance = isFinal and o.FinalTolerance or o.WaypointTolerance
@@ -288,8 +323,11 @@ function PathV2.Go(TweenV2, character, goal, options)
 				local velocity = root.AssemblyLinearVelocity
 				local ahead = Vector3.new(velocity.X, 0, velocity.Z) * o.LookAheadTime
 				if ahead.Magnitude > 16 then ahead = ahead.Unit * 16 end
-				if not clearSegment(root.Position, point) or not clearSegment(root.Position, root.Position + ahead) then
-					route:Repath("ObstacleAhead")
+				local segmentClear, segmentReason = clearSegment(root.Position, point)
+				local aheadClear, aheadReason = true, nil
+				if segmentClear then aheadClear, aheadReason = clearSegment(root.Position, root.Position + ahead) end
+				if not segmentClear or not aheadClear then
+					route:Repath("Waypoint" .. tostring(route.WaypointIndex) .. ":" .. (segmentReason or aheadReason))
 				elseif now - lastProgress >= o.StuckTime then
 					route:Repath("NoProgress")
 				end
