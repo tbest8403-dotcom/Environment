@@ -1,18 +1,25 @@
--- PathV2 grounded edition. No hover forces, vertical tweening, or above-safe finish.
--- TweenV2 smooths WalkSpeed only; Humanoid:Move handles grounded waypoint movement.
+-- PathV2 low-ground FORCE edition. Same spring movement; absolute floor-based height.
+-- No HTTP requests here. Load once, then PathV2.Go(TweenV2, character, goal, options).
+-- Ground paths only: jump/climb/custom-link traversal is intentionally disabled.
 local PathfindingService = game:GetService("PathfindingService")
 local RunService = game:GetService("RunService")
 local Workspace = game:GetService("Workspace")
-local HttpService = game:GetService("HttpService")
-local PathV2 = { Version = "2.0.0-grounded" }
-local active = setmetatable({}, { __mode = "k" })
+local PathV2 = { Version = "3.0.0-low-force" }
+local registryHost = type(shared) == "table" and shared or _G
+local registry = rawget(registryHost, "__PathV2LowForceRuntimeV1")
+if type(registry) ~= "table" or type(registry.Routes) ~= "table" then
+	registry = { Routes = setmetatable({}, { __mode = "k" }), NextComputeAt = 0 }
+	rawset(registryHost, "__PathV2LowForceRuntimeV1", registry)
+end
+local active = registry.Routes
 
-local function flat(v) return Vector3.new(v.X, 0, v.Z) end
-local function finite(v) return type(v) == "number" and v == v and math.abs(v) < math.huge end
+local function finite(n)
+	return type(n) == "number" and n == n and math.abs(n) < math.huge
+end
 
 function PathV2.RootHeight(character)
-	local root = assert(character:FindFirstChild("HumanoidRootPart"), "Missing HumanoidRootPart")
-	local humanoid = assert(character:FindFirstChildOfClass("Humanoid"), "Missing Humanoid")
+	local root = assert(character:FindFirstChild("HumanoidRootPart"), "PathV2: missing root")
+	local humanoid = assert(character:FindFirstChildOfClass("Humanoid"), "PathV2: missing Humanoid")
 	local height = humanoid.HipHeight + root.Size.Y / 2
 	if humanoid.RigType == Enum.HumanoidRigType.R6 then
 		local leg = character:FindFirstChild("Left Leg")
@@ -22,78 +29,118 @@ function PathV2.RootHeight(character)
 end
 
 function PathV2.Go(TweenV2, character, goal, options)
-	assert(type(TweenV2) == "function", "PathV2 requires your loaded TweenV2 function")
-	assert(RunService:IsClient(), "This PathV2 controller runs on the client")
-	assert(typeof(goal) == "Vector3" and finite(goal.Magnitude), "Goal must be a finite Vector3")
-	local root = assert(character:FindFirstChild("HumanoidRootPart"), "Missing HumanoidRootPart")
-	local humanoid = assert(character:FindFirstChildOfClass("Humanoid"), "Missing Humanoid")
+	assert(type(TweenV2) == "function", "PathV2: supply your loaded TweenV2 function")
+	assert(typeof(character) == "Instance" and character:IsA("Model"), "PathV2: character must be a Model")
+	assert(typeof(goal) == "Vector3" and finite(goal.Magnitude), "PathV2: goal must be a finite root Position")
+	local root = assert(character:FindFirstChild("HumanoidRootPart"), "PathV2: missing root")
+	local humanoid = assert(character:FindFirstChildOfClass("Humanoid"), "PathV2: missing Humanoid")
 	local defaults = {
-		WalkSpeed = 6, SpeedRampTime = 0.25,
 		AgentRadius = 2, AgentHeight = 6, WaypointSpacing = 4,
-		WaypointTolerance = 0.75, FinalTolerance = 1,
-		HeightTolerance = 2, CheckInterval = 0.1, LookAhead = 2,
-		StuckTime = 6, MinProgress = 0.1,
-		RepathDelay = 1, MaxReplans = 0,
-		ApproachMargin = 1, ProbeHeight = 1, ProbeDepth = 256,
+		Skin = 0.15, GroundClearance = 0, ApproachMargin = 1,
+		ProbeHeight = 2, ProbeDepth = 256,
+		CheckInterval = 0.1, LookAheadTime = 0.75,
+		StuckTime = 8, MinProgress = 0.02, RepathDelay = 2,
+		MaxReplans = 3, -- Retry count, not a travel-duration limit.
+		MaxCandidates = 2, MinComputeInterval = 1,
+		MaxGroundGap = 1, MaxGroundRise = 0.75,
+		WaypointTolerance = 0.15, FinalTolerance = 0.05,
 	}
-	local optional = { GoalPart = true, Owner = true, Costs = true }
+	local optional = { GoalPart = true, Owner = true, Ignore = true, Costs = true, TweenOptions = true }
 	local o = table.clone(defaults)
 	for key, value in pairs(options or {}) do
-		assert(defaults[key] ~= nil or optional[key], "Unknown grounded PathV2 option: " .. tostring(key))
+		assert(defaults[key] ~= nil or optional[key], "PathV2: unknown option " .. tostring(key))
 		o[key] = value
 	end
-	for key in pairs(defaults) do assert(finite(o[key]) and o[key] >= 0, "Invalid " .. key) end
-	assert(o.WalkSpeed > 0 and o.AgentRadius >= 1 and o.AgentHeight >= 2, "Invalid speed/body size")
-	assert(o.WaypointSpacing > 0 and o.WaypointTolerance > 0 and o.FinalTolerance > 0, "Invalid waypoint settings")
-	assert(o.CheckInterval > 0 and o.StuckTime > 0 and o.MinProgress > 0 and o.RepathDelay >= 0.1, "Invalid timing")
-	assert(o.MaxReplans % 1 == 0 and o.ProbeDepth > o.ProbeHeight, "Invalid retries/probe depth")
-	assert(o.GoalPart == nil or (typeof(o.GoalPart) == "Instance" and o.GoalPart:IsA("BasePart")), "GoalPart must be a BasePart")
-	assert(o.Owner == nil or typeof(o.Owner) == "Instance", "Owner must be an Instance")
+	for key in pairs(defaults) do
+		assert(finite(o[key]) and o[key] >= 0, "PathV2: invalid " .. key)
+	end
+	assert(o.AgentRadius >= 1 and o.AgentHeight >= 2 and o.Skin < math.min(o.AgentRadius, o.AgentHeight / 2), "PathV2: invalid body dimensions")
+	assert(o.WaypointSpacing > 0 and o.StuckTime > 0 and o.CheckInterval > 0 and o.RepathDelay >= 0.1, "PathV2: invalid spacing/timing")
+	assert(o.ProbeDepth > o.ProbeHeight and o.FinalTolerance > 0 and o.WaypointTolerance > 0 and o.MinProgress > 0, "PathV2: invalid clearance/progress settings")
+	assert(o.GroundClearance <= 0.25, "PathV2 low-force: GroundClearance must be <= 0.25")
+	assert(o.MaxCandidates >= 1 and o.MaxCandidates <= 8 and o.MaxCandidates % 1 == 0 and o.MinComputeInterval >= 0.5, "PathV2: invalid compute limits")
+	assert(o.MaxReplans % 1 == 0, "PathV2: MaxReplans must be an integer")
+	assert(o.GoalPart == nil or (typeof(o.GoalPart) == "Instance" and o.GoalPart:IsA("BasePart")), "PathV2: GoalPart must be a BasePart")
+	assert(o.Owner == nil or typeof(o.Owner) == "Instance", "PathV2: Owner must be an Instance")
+	local tuning = { Frequency = 0.2, Damping = 1, MaxForce = 100000, VelocityTolerance = 0.1, SettleTime = 0.1 }
+	for key, value in pairs(o.TweenOptions or {}) do
+		assert(tuning[key] ~= nil, "PathV2: unsupported TweenOptions key " .. tostring(key))
+		tuning[key] = value
+	end
+	for key, value in pairs(tuning) do assert(finite(value) and value >= 0, "PathV2: invalid " .. key) end
+	assert(tuning.Frequency > 0 and tuning.Frequency <= 100 and tuning.MaxForce > 0, "PathV2: invalid frequency/force")
+	assert(tuning.Damping >= 1 and tuning.Damping <= 10, "PathV2: use Damping >= 1 to avoid corner overshoot")
 	local footHeight = PathV2.RootHeight(character)
-	local casts = RaycastParams.new()
-	casts.FilterType = Enum.RaycastFilterType.Exclude
-	casts.FilterDescendantsInstances = { character }
-	casts.RespectCanCollide = true
-	casts.CollisionGroup = root.CollisionGroup
-	local overlaps = OverlapParams.new()
-	overlaps.FilterType = Enum.RaycastFilterType.Exclude
-	overlaps.FilterDescendantsInstances = { character }
-	overlaps.RespectCanCollide = true
-	overlaps.CollisionGroup = root.CollisionGroup
-	overlaps.MaxParts = 1
-	local events, path, pendingPath, blockedConnection, speedTween = {}, nil, nil, nil, nil
-	local done = Instance.new("BindableEvent")
-	local route = { Status = "Idle", Completed = done.Event, Replans = 0, WaypointIndex = 0 }
-	local direction, replan, revision = Vector3.zero, false, 0
-	local oldSpeed, oldRotate, oldJumpEnabled, owned = nil, nil, nil, false
-	local binding = "PathV2Grounded_" .. HttpService:GenerateGUID(false)
-	local bound = false
+	-- Upright body envelope: bottom above the soles, top at AgentHeight.
+	local bodySize = Vector3.new(2 * (o.AgentRadius - o.Skin), o.AgentHeight - 2 * o.Skin, 2 * (o.AgentRadius - o.Skin))
+	local bodyOffset = Vector3.new(0, o.AgentHeight / 2 - footHeight, 0)
+	local ignore = table.clone(o.Ignore or {})
+	table.insert(ignore, character)
+	local cast = RaycastParams.new()
+	cast.FilterType = Enum.RaycastFilterType.Exclude
+	cast.FilterDescendantsInstances = ignore
+	cast.RespectCanCollide = true
+	cast.CollisionGroup = root.CollisionGroup
+	local overlap = OverlapParams.new()
+	overlap.FilterType = Enum.RaycastFilterType.Exclude
+	overlap.FilterDescendantsInstances = ignore
+	overlap.RespectCanCollide = true
+	overlap.CollisionGroup = root.CollisionGroup
+	overlap.MaxParts = 1
 
-	local function clearPath()
-		if blockedConnection then blockedConnection:Disconnect(); blockedConnection = nil end
-		if path then path:Destroy(); path = nil end
+	local function occupied(position)
+		return #Workspace:GetPartBoundsInBox(CFrame.new(position + bodyOffset), bodySize, overlap) > 0
+	end
+	local function clearSegment(a, b)
+		if occupied(a) or occupied(b) then return false end
+		local direction = b - a
+		if direction.Magnitude <= 0.001 then return true end
+		return Workspace:Blockcast(CFrame.new(a + bodyOffset), bodySize, direction, cast) == nil
+	end
+	local function groundBelow(position)
+		local hit = Workspace:Raycast(position + Vector3.new(0, o.ProbeHeight, 0), Vector3.new(0, -o.ProbeDepth, 0), cast)
+		if hit and hit.Normal.Y >= 0.5 then return hit.Position end
+		return nil
+	end
+	local function standingAt(floor)
+		return floor + Vector3.new(0, footHeight + o.GroundClearance, 0)
+	end
+
+	local finished = Instance.new("BindableEvent")
+	local route = { Status = "Idle", Completed = finished.Event, Replans = 0, WaypointIndex = 0, Computations = 0 }
+	local connections, pathConnection, pathObject, pendingPath = {}, nil, nil, nil
+	local needsReplan, revision, oldRotate, ownsHumanoid = false, 0, nil, false
+	local function disposePath()
+		if pathConnection then pathConnection:Disconnect(); pathConnection = nil end
+		if pathObject then pathObject:Destroy(); pathObject = nil end
 		if pendingPath then pendingPath:Destroy(); pendingPath = nil end
+	end
+	local function stopMotion()
+		if route.Parking then
+			route.Parking:Cancel("PathV2Replan")
+			route.Parking = nil
+		end
+		if route.Motion then
+			route.Motion:Cancel("PathV2Replan")
+			route.Motion = nil
+		end
 	end
 	local function finish(status, detail)
 		if route.Result then return end
-		route.Status, route.Result, route.Detail = status, status, detail
-		direction = Vector3.zero
-		if bound then RunService:UnbindFromRenderStep(binding); bound = false end
-		clearPath()
-		if speedTween then speedTween:Cancel("RouteFinished"); speedTween = nil end
-		for _, connection in ipairs(events) do connection:Disconnect() end
-		table.clear(events)
+		route.Result, route.Status, route.Detail = status, status, detail
+		stopMotion()
+		disposePath()
+		for _, connection in ipairs(connections) do connection:Disconnect() end
+		table.clear(connections)
 		if active[character] == route then active[character] = nil end
-		if owned then
+		if ownsHumanoid then
 			pcall(function()
-				humanoid:Move(Vector3.zero, false)
-				humanoid.WalkSpeed = oldSpeed
-				humanoid.AutoRotate = oldRotate
-				humanoid:SetStateEnabled(Enum.HumanoidStateType.Jumping, oldJumpEnabled)
+				if humanoid.AutoRotate == false then humanoid.AutoRotate = oldRotate end
+				if humanoid.Health > 0 then humanoid:ChangeState(Enum.HumanoidStateType.GettingUp) end
 			end)
 		end
-		done:Fire(status, detail)
-		task.defer(function() done:Destroy() end)
+		finished:Fire(status, detail)
+		task.defer(function() finished:Destroy() end)
 	end
 	function route:Cancel(reason) finish("Cancelled", reason or "User") end
 	function route:Destroy() self:Cancel("Destroyed") end
@@ -103,164 +150,208 @@ function PathV2.Go(TweenV2, character, goal, options)
 	end
 	function route:Repath(reason)
 		if self.Result then return end
-		replan, revision, direction = true, revision + 1, Vector3.zero
+		needsReplan, revision = true, revision + 1
 		self.Detail = reason or "Requested"
+		stopMotion()
 	end
 	local function alive()
 		if route.Result then return false end
-		if not root.Parent or not humanoid.Parent or not character.Parent or humanoid.Health <= 0 then finish("Cancelled", "CharacterUnavailable"); return false end
-		if root.Anchored then finish("Failed", "RootAnchored"); return false end
+		if route.Parking and route.Parking.Result then finish("Cancelled", "ParkingTweenStopped"); return false end
+		if humanoid.Health <= 0 or not humanoid.Parent or not character.Parent or not root.Parent then finish("Cancelled", "CharacterUnavailable"); return false end
 		if o.GoalPart and not o.GoalPart:IsDescendantOf(Workspace) then finish("Cancelled", "GoalRemoved"); return false end
+		if root.Anchored then finish("Failed", "RootAnchored"); return false end
 		return true
 	end
-	local function waitGround()
-		direction = Vector3.zero
-		while alive() and humanoid.FloorMaterial == Enum.Material.Air do
-			route.Status = "WaitingForGround"
-			RunService.Heartbeat:Wait()
-		end
-		return alive()
+	local function waitRetry()
+		local untilTime = os.clock() + o.RepathDelay
+		while alive() and os.clock() < untilTime do RunService.Heartbeat:Wait() end
 	end
-	local function approachPoints()
-		local points = {}
-		local function add(sample)
-			local hit = Workspace:Raycast(sample + Vector3.new(0, o.ProbeHeight, 0), Vector3.new(0, -o.ProbeDepth, 0), casts)
-			if not hit or hit.Normal.Y < 0.5 then return end
-			local boxCenter = hit.Position + Vector3.new(0, o.AgentHeight / 2 + 0.1, 0)
-			local size = Vector3.new(o.AgentRadius * 2 - 0.2, o.AgentHeight - 0.2, o.AgentRadius * 2 - 0.2)
-			if #Workspace:GetPartBoundsInBox(CFrame.new(boxCenter), size, overlaps) == 0 then
-				table.insert(points, hit.Position)
+	local function floorTarget(point)
+		-- Height comes ONLY from the physical floor below the current root.
+		-- Never add root height to a previous target or use the safe's top.
+		local hit = Workspace:Raycast(root.Position, Vector3.new(0, -o.ProbeDepth, 0), cast)
+		if not hit or hit.Normal.Y < 0.5 then
+			route:Cancel("GroundMissing")
+			return root.Position
+		end
+		local targetY = hit.Position.Y + footHeight + o.GroundClearance
+		if root.Position.Y - targetY > o.MaxGroundGap then
+			route:Cancel("TooFarAboveGround")
+			return root.Position
+		end
+		if targetY - root.Position.Y > o.MaxGroundRise then
+			route:Repath("GroundStepTooHigh")
+			return root.Position
+		end
+		return Vector3.new(point.X, targetY, point.Z)
+	end
+	local function park()
+		if route.Parking then return end
+		local config = table.clone(tuning)
+		config.Mode, config.GravityScale, config.Timeout = "Force", 0, 0
+		config.Hold, config.StopOnCancel = true, true
+		local holdPoint = root.Position
+		route.Parking = TweenV2(root, { Position = function() return floorTarget(holdPoint) end }, config)
+	end
+
+	local function candidates()
+		local result = {}
+		local function add(point)
+			local floor = groundBelow(point)
+			if floor then
+				local stand = standingAt(floor)
+				if not occupied(stand) then table.insert(result, { Floor = floor, Stand = stand }) end
 			end
 		end
 		if o.GoalPart then
+			-- Sample outside the safe's footprint; never exclude the safe from casts.
 			local part = o.GoalPart
 			local extent = part.Size / 2 + Vector3.new(o.AgentRadius + o.ApproachMargin, 0, o.AgentRadius + o.ApproachMargin)
-			for _, d in ipairs({ Vector3.new(1, 0, 0), Vector3.new(-1, 0, 0), Vector3.new(0, 0, 1), Vector3.new(0, 0, -1), Vector3.new(1, 0, 1), Vector3.new(-1, 0, 1), Vector3.new(1, 0, -1), Vector3.new(-1, 0, -1) }) do
-				local p = part.CFrame:PointToWorldSpace(Vector3.new(d.X * extent.X, 0, d.Z * extent.Z))
-				-- Ground probes use the object's level, never a repeated root-height lift.
-				add(Vector3.new(p.X, part.Position.Y, p.Z))
+			for _, direction in ipairs({ Vector3.new(1, 0, 0), Vector3.new(-1, 0, 0), Vector3.new(0, 0, 1), Vector3.new(0, 0, -1), Vector3.new(1, 0, 1), Vector3.new(-1, 0, 1), Vector3.new(1, 0, -1), Vector3.new(-1, 0, -1) }) do
+				local point = part.CFrame:PointToWorldSpace(Vector3.new(direction.X * extent.X, 0, direction.Z * extent.Z))
+				add(Vector3.new(point.X, math.max(point.Y, root.Position.Y), point.Z))
 			end
 		else
 			add(goal)
 		end
-		table.sort(points, function(a, b) return (a - root.Position).Magnitude < (b - root.Position).Magnitude end)
-		return points
+		table.sort(result, function(a, b) return (a.Stand - root.Position).Magnitude < (b.Stand - root.Position).Magnitude end)
+		return result
 	end
+
 	local function plan(expectedRevision)
-		local reason = "NoClearGroundBesideGoal"
-		for _, destination in ipairs(approachPoints()) do
+		local why = "NoClearGroundApproach"
+		local approaches = candidates()
+		for attempt = 1, math.min(o.MaxCandidates, #approaches) do
+			local candidate = approaches[(route.Replans * o.MaxCandidates + attempt - 1) % #approaches + 1]
 			if not alive() or revision ~= expectedRevision then return nil, nil, "Interrupted" end
-			local candidate = PathfindingService:CreatePath({
-				AgentRadius = math.ceil(o.AgentRadius), AgentHeight = math.ceil(o.AgentHeight),
-				AgentCanJump = false, AgentCanClimb = false,
-				WaypointSpacing = o.WaypointSpacing, Costs = o.Costs or {},
-			})
-			pendingPath = candidate
-			local ok, err = pcall(function() candidate:ComputeAsync(root.Position, destination) end)
-			if not alive() or revision ~= expectedRevision then candidate:Destroy(); pendingPath = nil; return nil, nil, "Interrupted" end
-			if ok and candidate.Status == Enum.PathStatus.Success then
-				local waypoints = candidate:GetWaypoints()
-				local usable = #waypoints > 0
-				for _, waypoint in ipairs(waypoints) do
-					if waypoint.Action ~= Enum.PathWaypointAction.Walk then usable = false; break end
-				end
-				if usable then pendingPath = nil; return candidate, waypoints end
-				reason = "RouteRequiresUnsupportedTraversal"
-			else
-				reason = ok and "NoPath" or tostring(err)
+			local waitingSince = os.clock()
+			while registry.ComputeOwner or os.clock() < registry.NextComputeAt do
+				if not alive() or revision ~= expectedRevision then return nil, nil, "Interrupted" end
+				if os.clock() - waitingSince > 10 then finish("Failed", "PathfindingBusy"); return nil, nil, "PathfindingBusy" end
+				RunService.Heartbeat:Wait()
 			end
-			candidate:Destroy()
+			local path = PathfindingService:CreatePath({ AgentRadius = math.ceil(o.AgentRadius), AgentHeight = math.ceil(o.AgentHeight), AgentCanJump = false, AgentCanClimb = false, WaypointSpacing = o.WaypointSpacing, Costs = o.Costs or {} })
+			pendingPath = path
+			registry.ComputeOwner = route
+			registry.NextComputeAt = os.clock() + o.MinComputeInterval
+			route.Computations = route.Computations + 1
+			local ok, err = pcall(function() path:ComputeAsync(root.Position, candidate.Floor) end)
+			if registry.ComputeOwner == route then registry.ComputeOwner = nil end
+			if not alive() or revision ~= expectedRevision then path:Destroy(); pendingPath = nil; return nil, nil, "Interrupted" end
+			if ok and path.Status == Enum.PathStatus.Success then
+				local steps, valid = {}, true
+				local previous = root.Position
+				local waypoints = path:GetWaypoints()
+				if #waypoints == 0 then valid = false end
+				for index, waypoint in ipairs(waypoints) do
+					-- Lift ground waypoints only for clearance checks, not the force Y target.
+					local point = standingAt(waypoint.Position)
+					if waypoint.Action ~= Enum.PathWaypointAction.Walk or not clearSegment(previous, point) then valid = false; break end
+					table.insert(steps, { Position = point, PathIndex = index })
+					previous = point
+				end
+				-- Finish at reachable ground beside GoalPart. No rise/cross/docking phase.
+				if valid then pendingPath = nil; return path, steps end
+				why = "BodyClearanceOrUnsupportedLink"
+			else
+				why = ok and "NoPath" or tostring(err)
+			end
+			path:Destroy()
 			pendingPath = nil
 		end
-		return nil, nil, reason
+		return nil, nil, why
 	end
-	local function walkTo(point, tolerance)
-		local best, lastProgress, lastCheck = math.huge, os.clock(), 0
-		while alive() and not replan do
-			local delta = flat(point - root.Position)
-			local distance = delta.Magnitude
-			local grounded = humanoid.FloorMaterial ~= Enum.Material.Air
-			local feetY = root.Position.Y - footHeight
-			if grounded and distance <= tolerance and math.abs(feetY - point.Y) <= o.HeightTolerance then direction = Vector3.zero; return true end
-			if not grounded then
-				direction = Vector3.zero
-				route:Repath("GroundLost")
-				return false
-			end
-			local now = os.clock()
-			if best - distance >= o.MinProgress then best, lastProgress = distance, now end
-			if now - lastProgress >= o.StuckTime then route:Repath("NoProgress"); return false end
-			direction = distance > 0.001 and delta.Unit or Vector3.zero
-			if now - lastCheck >= o.CheckInterval and distance > tolerance then
-				lastCheck = now
-				-- Check ahead at torso height. Steps remain handled by the Humanoid.
-				local size = Vector3.new(o.AgentRadius * 2 - 0.2, math.max(root.Size.Y, 1), o.AgentRadius * 2 - 0.2)
-				local hit = Workspace:Blockcast(CFrame.new(root.Position), size, direction * math.min(o.LookAhead, distance), casts)
-				if hit then route:Repath("ObstacleAhead"); return false end
-			end
-			RunService.Heartbeat:Wait()
+
+	local function follow(point, isFinal)
+		if not clearSegment(root.Position, point) then route:Repath("Obstacle"); return false end
+		local config = table.clone(tuning)
+		config.Mode, config.GravityScale, config.Timeout = "Force", 0, 0
+		config.PositionTolerance = isFinal and o.FinalTolerance or o.WaypointTolerance
+		config.StopOnFinish, config.StopOnCancel = true, true
+		-- Manage Humanoid once for the whole route, rather than toggling at every corner.
+		local motion = TweenV2(root, { Position = function() return floorTarget(point) end }, config)
+		route.Motion = motion
+		local function horizontalDistance()
+			local d = root.Position - point
+			return Vector3.new(d.X, 0, d.Z).Magnitude
 		end
-		direction = Vector3.zero
-		return false
+		local bestDistance = horizontalDistance()
+		local lastProgress, lastCheck = os.clock(), 0
+		while alive() and not needsReplan and not motion.Result do
+			RunService.Heartbeat:Wait()
+			if not alive() or needsReplan or motion.Result then break end
+			local now = os.clock()
+			local distance = horizontalDistance()
+			if bestDistance - distance >= o.MinProgress then bestDistance, lastProgress = distance, now end
+			if now - lastCheck >= o.CheckInterval then
+				lastCheck = now
+				local velocity = root.AssemblyLinearVelocity
+				local ahead = Vector3.new(velocity.X, 0, velocity.Z) * o.LookAheadTime
+				if ahead.Magnitude > 16 then ahead = ahead.Unit * 16 end
+				if not clearSegment(root.Position, point) or not clearSegment(root.Position, root.Position + ahead) then
+					route:Repath("ObstacleAhead")
+				elseif now - lastProgress >= o.StuckTime then
+					route:Repath("NoProgress")
+				end
+			end
+		end
+		if route.Result or needsReplan then motion:Cancel("PathV2Replan"); return false end
+		if motion.Result ~= "Completed" then finish("Cancelled", "TweenStopped:" .. tostring(motion.Detail or motion.Result)); return false end
+		if route.Motion == motion then route.Motion = nil end
+		return true
 	end
 
 	if active[character] then active[character]:Cancel("Replaced") end
 	active[character] = route
-	table.insert(events, humanoid.Died:Connect(function() finish("Cancelled", "Died") end))
-	table.insert(events, humanoid.Destroying:Connect(function() finish("Cancelled", "HumanoidDestroyed") end))
-	table.insert(events, root.Destroying:Connect(function() finish("Cancelled", "RootDestroyed") end))
-	table.insert(events, character.Destroying:Connect(function() finish("Cancelled", "CharacterDestroyed") end))
-	if o.GoalPart then table.insert(events, o.GoalPart.Destroying:Connect(function() finish("Cancelled", "GoalDestroyed") end)) end
-	if o.Owner then table.insert(events, o.Owner.Destroying:Connect(function() finish("Cancelled", "OwnerDestroyed") end)) end
+	table.insert(connections, humanoid.Died:Connect(function() finish("Cancelled", "Died") end))
+	table.insert(connections, humanoid.Destroying:Connect(function() finish("Cancelled", "HumanoidDestroyed") end))
+	table.insert(connections, character.Destroying:Connect(function() finish("Cancelled", "CharacterDestroyed") end))
+	table.insert(connections, root.Destroying:Connect(function() finish("Cancelled", "RootDestroyed") end))
+	if o.GoalPart then table.insert(connections, o.GoalPart.Destroying:Connect(function() finish("Cancelled", "GoalDestroyed") end)) end
+	if o.Owner then table.insert(connections, o.Owner.Destroying:Connect(function() finish("Cancelled", "OwnerDestroyed") end)) end
 	task.spawn(function()
 		local ok, err = pcall(function()
 			if not alive() then return end
-			assert(not root:FindFirstChild("TweenV2Force"), "Stop the old hovering script and reset your character before using grounded PathV2")
-			oldSpeed, oldRotate = humanoid.WalkSpeed, humanoid.AutoRotate
-			oldJumpEnabled = humanoid:GetStateEnabled(Enum.HumanoidStateType.Jumping)
-			owned = true
-			humanoid.AutoRotate = true
-			humanoid:SetStateEnabled(Enum.HumanoidStateType.Jumping, false)
-			if humanoid:GetState() == Enum.HumanoidStateType.Physics then humanoid:ChangeState(Enum.HumanoidStateType.GettingUp) end
-			-- Only a numeric property is tweened. Never root Position/CFrame.
-			speedTween = TweenV2(humanoid, { WalkSpeed = o.WalkSpeed }, {
-				Mode = "Eased", Duration = o.SpeedRampTime, Ease = "Smooth", Timeout = 0,
-			})
-			RunService:BindToRenderStep(binding, Enum.RenderPriority.Character.Value + 1, function()
-				if not route.Result and humanoid.Parent then
-					humanoid:Move(humanoid.FloorMaterial ~= Enum.Material.Air and direction or Vector3.zero, false)
-				end
-			end)
-			bound = true
+			assert(not root:FindFirstChild("TweenV2Force"), "Stop older movement scripts and reset before starting low-force PathV2")
+			oldRotate, ownsHumanoid = humanoid.AutoRotate, true
+			humanoid.AutoRotate = false
+			assert(humanoid:GetStateEnabled(Enum.HumanoidStateType.Physics), "PathV2: Physics state is disabled")
+			humanoid:ChangeState(Enum.HumanoidStateType.Physics)
+			root.AssemblyLinearVelocity = Vector3.zero
+			root.AssemblyAngularVelocity = Vector3.zero
 			while alive() do
-				replan, direction = false, Vector3.zero
-				clearPath()
-				if not waitGround() then return end
+				needsReplan = false
+				disposePath()
+				park()
 				route.Status = "Planning"
 				local expectedRevision = revision
-				local candidate, waypoints, why = plan(expectedRevision)
-				if not alive() then if candidate then candidate:Destroy() end; return end
-				if candidate and revision == expectedRevision then
-					path = candidate
-					blockedConnection = path.Blocked:Connect(function(index)
+				local path, steps, why = plan(expectedRevision)
+				if not alive() then if path then path:Destroy() end; return end
+				if path and revision == expectedRevision then
+					stopMotion()
+					pathObject = path
+					pathConnection = path.Blocked:Connect(function(index)
 						if index >= route.WaypointIndex then route:Repath("PathBlocked") end
 					end)
-					route.Status = "Walking"
+					route.Status = "Moving"
 					local completed = true
-					for index, waypoint in ipairs(waypoints) do
-						route.WaypointIndex = index
-						if not walkTo(waypoint.Position, index == #waypoints and o.FinalTolerance or o.WaypointTolerance) then completed = false; break end
+					for index, waypoint in ipairs(steps) do
+						if not alive() or needsReplan then completed = false; break end
+						route.WaypointIndex = waypoint.PathIndex
+						if not follow(waypoint.Position, index == #steps) then completed = false; break end
 					end
 					if completed and alive() then finish("Completed"); return end
-				elseif candidate then candidate:Destroy() end
+				elseif path then
+					path:Destroy()
+				end
 				if not alive() then return end
-				clearPath()
+				disposePath()
 				route.Replans = route.Replans + 1
 				route.Status = "WaitingForPath"
 				route.Detail = why or route.Detail or "Replanning"
 				if o.MaxReplans > 0 and route.Replans > o.MaxReplans then finish("NoPath", route.Detail); return end
-				local untilTime = os.clock() + o.RepathDelay
-				while alive() and os.clock() < untilTime do RunService.Heartbeat:Wait() end
+				park()
+				waitRetry()
 			end
 		end)
 		if not ok then finish("Failed", tostring(err)); warn("PathV2: " .. tostring(err)) end
