@@ -1,0 +1,529 @@
+-- AdonisOwnerGuard
+-- Owner-side runtime debugging guard for the supplied Adonis/XIIX environment.
+-- Require or load this file, then call Guard:Start().
+
+local ENV = (type(getgenv) == "function" and getgenv()) or _G
+local SLOT = "__ADONIS_OWNER_GUARD_V1"
+local existing = rawget(ENV, SLOT)
+if type(existing) == "table" and existing.Version == 1 then
+    return existing
+end
+
+local Guard = {
+    Version = 1,
+    Running = false,
+    Busy = false,
+    AdonisReady = false,
+    LoaderReady = false,
+    RZDONReady = false,
+    RZDONBlocked = true,
+    DetectorHooks = {},
+    LoaderHooks = {},
+    RemoteHooks = {},
+    UserHooks = {},
+    StoppedThreads = setmetatable({}, { __mode = "k" }),
+    StoppedThreadCount = 0,
+    ParkedCalls = 0,
+    LoaderParkedCalls = 0,
+    BlockedRZDONCalls = 0,
+    Errors = {},
+    Events = {},
+}
+
+Guard.Defaults = {
+    CloseAdonisThreads = true,
+    SuppressLoaderPunishments = false,
+    RequireAdonisForRemote = true,
+    BlockRZDON = true,
+}
+
+local function push(list, value, limit)
+    table.insert(list, tostring(value))
+    if #list > (limit or 80) then table.remove(list, 1) end
+end
+
+local function record(message)
+    push(Guard.Events, message)
+end
+
+local function problem(message)
+    push(Guard.Errors, message)
+    record("ERROR: " .. tostring(message))
+end
+
+local function mark(callback)
+    pcall(setstackhidden, callback, true)
+end
+
+local function sameInstance(first, second)
+    if first == second then return true end
+    local ok, result = pcall(compareinstances, first, second)
+    return ok and result == true
+end
+
+local function restoreRecord(record)
+    local restore = record.kind == "oth" and oth.unhook or restorefunction
+    local ok, result = pcall(restore, record.target)
+    return ok and result ~= false, result
+end
+
+local function restoreList(list)
+    local failures = {}
+    for index = #list, 1, -1 do
+        local recordItem = list[index]
+        local ok, result = restoreRecord(recordItem)
+        if ok then
+            table.remove(list, index)
+        else
+            table.insert(failures, recordItem.name .. ": " .. tostring(result))
+        end
+    end
+    return #failures == 0, table.concat(failures, " / ")
+end
+
+local function installFunction(target, replacement, name, destination)
+    assert(type(target) == "function", name .. " target is not a function")
+    local inspected, hooked = pcall(isfunctionhooked, target)
+    assert(inspected, name .. " hook state is unavailable")
+    assert(not hooked, name .. " is already hooked")
+    mark(replacement)
+    local recordItem = { target = target, name = name }
+    local original
+    if iscclosure(target) then
+        recordItem.kind = "oth"
+        original = oth.hook(target, replacement)
+    else
+        recordItem.kind = "lua"
+        local wrapped = newcclosure(replacement)
+        mark(wrapped)
+        original = hookfunction(target, wrapped)
+    end
+    assert(type(original) == "function", name .. " did not return its original")
+    recordItem.original = original
+    table.insert(destination, recordItem)
+    return original, recordItem
+end
+
+-- Public helper for owner experiments. It uses OTH only for C targets.
+function Guard:HookFunction(target, replacement, name)
+    local original = installFunction(target, replacement, name or "owner hook", self.UserHooks)
+    return original
+end
+
+function Guard:HookMetamethod(object, method, replacement, name)
+    local metatable = getrawmetatable(object)
+    local target = type(metatable) == "table" and rawget(metatable, method)
+    return self:HookFunction(target, replacement, name or method)
+end
+
+function Guard:Unhook(target)
+    for _, list in ipairs({ self.UserHooks, self.RemoteHooks, self.DetectorHooks }) do
+        for index = #list, 1, -1 do
+            if list[index].target == target then
+                local ok, result = restoreRecord(list[index])
+                if ok then table.remove(list, index) end
+                return ok, result
+            end
+        end
+    end
+    return false, "target is not owned by this guard"
+end
+
+local function matchesAdonisSource(source)
+    if type(source) ~= "string" then return false end
+    for _, marker in ipairs({ ".Core.Anti", ".Plugins.Anti_Cheat" }) do
+        local _, last = source:find(marker, 1, true)
+        if last and not source:sub(last + 1, last + 1):match("[%w_]") then return true end
+    end
+    return false
+end
+
+local function suppressAdonis(options)
+    local threadOk, threads = pcall(function()
+        return type(getreg) == "function" and getreg() or getallthreads()
+    end)
+    if not threadOk or type(threads) ~= "table" then
+        problem("Adonis thread scan failed: " .. tostring(threads))
+    elseif options.CloseAdonisThreads then
+        for _, thread in pairs(threads) do
+            if type(thread) == "thread" and thread ~= coroutine.running()
+                and not Guard.StoppedThreads[thread] then
+                local infoOk, source = pcall(debug.info, thread, 1, "s")
+                if infoOk and matchesAdonisSource(source) and coroutine.status(thread) ~= "dead" then
+                    local closeOk, result = pcall(coroutine.close, thread)
+                    if closeOk and result ~= false and coroutine.status(thread) == "dead" then
+                        Guard.StoppedThreads[thread] = true
+                        Guard.StoppedThreadCount = Guard.StoppedThreadCount + 1
+                        record("Stopped Adonis thread: " .. source)
+                    else
+                        problem("Could not stop Adonis thread: " .. tostring(result))
+                    end
+                end
+            end
+        end
+    end
+
+    local gcOk, objects = pcall(getgc, true)
+    if not gcOk or type(objects) ~= "table" then
+        problem("Adonis table scan failed: " .. tostring(objects))
+        return false
+    end
+    local tables, seen, targets = 0, {}, {}
+    for _, object in pairs(objects) do
+        if type(object) == "table" then
+            local detected = rawget(object, "Detected")
+            local rlocked = rawget(object, "RLocked")
+            local addDetector = rawget(object, "AddDetector")
+            local detectors = rawget(object, "Detectors")
+            local matched = type(detected) == "function" and (
+                rlocked ~= nil or type(addDetector) == "function" or type(detectors) == "table"
+            )
+            if matched then
+                tables = tables + 1
+                for key, target in next, object do
+                    if type(target) == "function" and not seen[target] then
+                        seen[target] = true
+                        table.insert(targets, { target = target, name = "Adonis." .. tostring(key) })
+                    end
+                end
+            end
+        end
+    end
+    if tables == 0 or #targets == 0 then
+        problem("No initialized Adonis detector table was found")
+        return false
+    end
+
+    -- Preflight every target so a known conflict makes no partial changes.
+    for _, targetInfo in ipairs(targets) do
+        local ok, hooked = pcall(isfunctionhooked, targetInfo.target)
+        if not ok or hooked then
+            problem(targetInfo.name .. " is already hooked or cannot be inspected")
+            return false
+        end
+    end
+
+    local startIndex = #Guard.DetectorHooks
+    local ok, err = pcall(function()
+        for _, targetInfo in ipairs(targets) do
+            local original
+            local function detour(...)
+                if Guard.Running then
+                    Guard.ParkedCalls = Guard.ParkedCalls + 1
+                    record("Suppressed " .. targetInfo.name)
+                    coroutine.yield()
+                    return task.wait(9e9)
+                end
+                return original(...)
+            end
+            original = installFunction(targetInfo.target, detour, targetInfo.name, Guard.DetectorHooks)
+        end
+    end)
+    if not ok then
+        problem("Adonis hook installation failed: " .. tostring(err))
+        for index = #Guard.DetectorHooks, startIndex + 1, -1 do
+            local restored = restoreRecord(Guard.DetectorHooks[index])
+            if restored then table.remove(Guard.DetectorHooks, index) end
+        end
+        return false
+    end
+    Guard.AdonisReady = true
+    record("Adonis suppression ready: " .. #targets .. " unique functions / " .. tables .. " table copies")
+    return true
+end
+
+local function findRZDON()
+    local storage = game:GetService("ReplicatedStorage")
+    local events = storage:FindFirstChild("Events")
+    local remote = events and events:FindFirstChild("__RZDONL")
+    if remote and remote:IsA("RemoteEvent") then return remote end
+    return nil
+end
+
+-- Passive loader discovery: inspect existing closures only. This never indexes
+-- Client.Kill and never calls or hooks its generator.
+local function suppressLoaderPunishments()
+    local objects = getgc(true)
+    assert(type(objects) == "table", "Loader scan did not return a table")
+    local targets, seen = {}, {}
+    local clients = 0
+    local function add(target, name)
+        if not seen[target] then
+            seen[target] = true
+            table.insert(targets, { target = target, name = name })
+        end
+    end
+    for _, client in pairs(objects) do
+        if type(client) == "table" and type(rawget(client, "Disconnect")) == "function"
+            and type(rawget(client, "LogError")) == "function"
+            and type(rawget(client, "Pcall")) == "function"
+            and type(rawget(client, "Routine")) == "function"
+            and type(rawget(client, "Handlers")) == "table"
+            and type(rawget(client, "Modules")) == "table"
+            and type(rawget(client, "Deps")) == "table"
+            and rawget(client, "Service") ~= nil then
+            clients = clients + 1
+            local service = rawget(client, "Service")
+            local mt = getrawmetatable(client)
+            local getter = type(mt) == "table" and rawget(mt, "__index")
+            assert(type(getter) == "function", "Client Kill getter missing")
+            local constants = debug.getconstants(getter)
+            assert(type(constants) == "table", "Client Kill constants unavailable")
+            local hasKill, hasFailure
+            for _, value in next, constants do
+                if value == "Kill" then hasKill = true end
+                if value == "Adonis (PlrClientIndexKlErr)" then hasFailure = true end
+            end
+            assert(hasKill and hasFailure, "Client Kill getter differs from supplied loader")
+            local captures = debug.getupvalues(getter)
+            assert(type(captures) == "table", "Client Kill captures unavailable")
+            local generator, count, hasPcall, hasType, hasService = nil, 0
+            for _, value in next, captures do
+                if rawequal(value, pcall) then hasPcall = true
+                elseif rawequal(value, type) then hasType = true
+                elseif rawequal(value, service) then hasService = true
+                elseif type(value) == "function" then generator = value; count = count + 1 end
+            end
+            assert(hasPcall and hasType and hasService and count == 1,
+                "Client Kill generator reference is ambiguous")
+            local source = debug.info(getter, "s")
+            assert(type(source) == "string", "Client Kill source unavailable")
+            local payloads = {}
+            for _, candidate in pairs(objects) do
+                if type(candidate) == "function" and not iscclosure(candidate) then
+                    local inspected, values = pcall(function()
+                        if debug.info(candidate, "s") == source then return debug.getupvalues(candidate) end
+                    end)
+                    if inspected and type(values) == "table" then
+                        local foundGenerator, foundService, foundPcall, foundWrap
+                        local valueCount = 0
+                        for _, value in next, values do
+                            valueCount = valueCount + 1
+                            if rawequal(value, generator) then foundGenerator = true end
+                            if rawequal(value, service) then foundService = true end
+                            if rawequal(value, pcall) then foundPcall = true end
+                            if rawequal(value, coroutine.wrap) then foundWrap = true end
+                        end
+                        if valueCount == 5 and foundGenerator and foundService and foundPcall and foundWrap then
+                            payloads[candidate] = true
+                        end
+                    end
+                end
+            end
+            local payload = next(payloads)
+            assert(payload and next(payloads, payload) == nil,
+                "Client Kill/ReadError payload missing or ambiguous")
+            add(rawget(client, "Disconnect"), "Client.Disconnect")
+            add(payload, "Client.Kill / ReadError payload")
+        end
+    end
+    assert(clients > 0, "No matching initialized Adonis loader found")
+    for _, targetInfo in ipairs(targets) do
+        local ok, hooked = pcall(isfunctionhooked, targetInfo.target)
+        assert(ok and not hooked, targetInfo.name .. " is already hooked or unavailable")
+    end
+    local startIndex = #Guard.LoaderHooks
+    local ok, err = pcall(function()
+        for _, targetInfo in ipairs(targets) do
+            local original
+            local function detour(...)
+                if Guard.Running and Guard.LoaderReady then
+                    Guard.LoaderParkedCalls = Guard.LoaderParkedCalls + 1
+                    record("Suppressed " .. targetInfo.name)
+                    coroutine.yield()
+                    return task.wait(9e9)
+                end
+                return original(...)
+            end
+            original = installFunction(targetInfo.target, detour, targetInfo.name, Guard.LoaderHooks)
+        end
+    end)
+    if not ok then
+        for index = #Guard.LoaderHooks, startIndex + 1, -1 do
+            local restored = restoreRecord(Guard.LoaderHooks[index])
+            if restored then table.remove(Guard.LoaderHooks, index) end
+        end
+        error(err, 0)
+    end
+    Guard.LoaderReady = true
+    record("Loader punishment suppression ready: " .. #targets .. " unique functions")
+    return true
+end
+
+local remoteGuard = setmetatable({}, { __mode = "k" })
+
+local function installRZDON()
+    local remote = findRZDON()
+    if not remote then
+        problem("ReplicatedStorage.Events.__RZDONL was not found")
+        return false
+    end
+    local targets = {
+        { target = remote.FireServer, name = "__RZDONL cached FireServer", method = "FireServer" },
+        { target = getrawmetatable(game).__namecall, name = "__RZDONL namecall" },
+    }
+    for _, targetInfo in ipairs(targets) do
+        local ok, hooked = pcall(isfunctionhooked, targetInfo.target)
+        if not ok or hooked then
+            problem(targetInfo.name .. " is already hooked or cannot be inspected")
+            return false
+        end
+    end
+
+    local startIndex = #Guard.RemoteHooks
+    local ok, err = pcall(function()
+        for _, targetInfo in ipairs(targets) do
+            local original
+            local function detour(instance, ...)
+                local method = targetInfo.method or getnamecallmethod()
+                if method ~= "FireServer" then return original(instance, ...) end
+                local caller = oth.get_original_thread()
+                local hookThread = coroutine.running()
+                if (caller and remoteGuard[caller]) or (hookThread and remoteGuard[hookThread]) then
+                    return original(instance, ...)
+                end
+                if sameInstance(instance, remote) and Guard.Running and Guard.RZDONBlocked then
+                    Guard.BlockedRZDONCalls = Guard.BlockedRZDONCalls + 1
+                    record("Blocked __RZDONL FireServer")
+                    return
+                end
+                local oldCaller = caller and remoteGuard[caller]
+                local oldHook = hookThread and remoteGuard[hookThread]
+                if caller then remoteGuard[caller] = true end
+                if hookThread then remoteGuard[hookThread] = true end
+                local result = table.pack(pcall(original, instance, ...))
+                if caller then remoteGuard[caller] = oldCaller end
+                if hookThread then remoteGuard[hookThread] = oldHook end
+                if not result[1] then error(result[2], 0) end
+                return table.unpack(result, 2, result.n)
+            end
+            mark(detour)
+            targetInfo.kind = "oth"
+            original = oth.hook(targetInfo.target, detour)
+            assert(type(original) == "function", targetInfo.name .. " did not return its original")
+            targetInfo.original = original
+            table.insert(Guard.RemoteHooks, targetInfo)
+        end
+    end)
+    if not ok then
+        problem("__RZDONL hook installation failed: " .. tostring(err))
+        for index = #Guard.RemoteHooks, startIndex + 1, -1 do
+            local restored = restoreRecord(Guard.RemoteHooks[index])
+            if restored then table.remove(Guard.RemoteHooks, index) end
+        end
+        return false
+    end
+    Guard.RZDONReady = true
+    record("__RZDONL blocked on colon and cached FireServer routes")
+    return true
+end
+
+local function mergedOptions(options)
+    local result = {}
+    options = type(options) == "table" and options or {}
+    for key, value in pairs(Guard.Defaults) do
+        local supplied = rawget(options, key)
+        result[key] = supplied == nil and value or supplied
+    end
+    return result
+end
+
+function Guard:Start(options)
+    if self.Busy then return false, "guard is busy" end
+    if self.Running then return true, self:GetStatus() end
+    self.Busy = true
+    self.Errors = {}
+    local settings = mergedOptions(options)
+    self.RZDONBlocked = settings.BlockRZDON
+    -- Detours check Running, so enable suppression immediately after each
+    -- install instead of leaving a newly hooked original path exposed.
+    self.Running = true
+    local adonisOk = suppressAdonis(settings)
+    local adonisRequiredOk = adonisOk or not settings.RequireAdonisForRemote
+    local loaderOk = true
+    if settings.SuppressLoaderPunishments then
+        local loaderError
+        loaderOk, loaderError = pcall(suppressLoaderPunishments)
+        if not loaderOk then problem("Loader punishment suppression failed: " .. tostring(loaderError)) end
+    end
+    local remoteOk = false
+    if adonisRequiredOk and loaderOk then remoteOk = installRZDON() end
+    if not adonisRequiredOk or not loaderOk or not remoteOk then
+        local remoteRestored = restoreList(self.RemoteHooks)
+        local loaderRestored = restoreList(self.LoaderHooks)
+        local detectorRestored = restoreList(self.DetectorHooks)
+        self.Running = false
+        self.AdonisReady = false
+        self.RZDONReady = false
+        self.Busy = false
+        self.LoaderReady = false
+        return false, self:GetStatus(), remoteRestored and loaderRestored and detectorRestored
+    end
+    self.Busy = false
+    return true, self:GetStatus()
+end
+
+function Guard:EnableLoaderGuard()
+    if not self.Running then return false, "start the guard first" end
+    if self.LoaderReady then return true, self:GetStatus() end
+    local ok, err = pcall(suppressLoaderPunishments)
+    if not ok then
+        problem("Loader punishment suppression failed: " .. tostring(err))
+        return false, err
+    end
+    return true, self:GetStatus()
+end
+
+function Guard:DisableLoaderGuard()
+    self.LoaderReady = false
+    local ok, err = restoreList(self.LoaderHooks)
+    return ok, err
+end
+
+function Guard:SetRZDONBlocked(blocked)
+    self.RZDONBlocked = blocked == true
+    record("__RZDONL blocking " .. (self.RZDONBlocked and "enabled" or "disabled"))
+end
+
+function Guard:Stop(restoreOwnerHooks)
+    if self.Busy then return false, "guard is busy" end
+    self.Busy = true
+    self.Running = false
+    self.AdonisReady = false
+    self.LoaderReady = false
+    self.RZDONReady = false
+    local remoteOk, remoteError = restoreList(self.RemoteHooks)
+    local loaderOk, loaderError = restoreList(self.LoaderHooks)
+    local detectorOk, detectorError = restoreList(self.DetectorHooks)
+    local ownerOk, ownerError = true, ""
+    if restoreOwnerHooks ~= false then ownerOk, ownerError = restoreList(self.UserHooks) end
+    self.Busy = false
+    record("Stopped. Closed threads and parked calls require a rejoin.")
+    return remoteOk and loaderOk and detectorOk and ownerOk,
+        table.concat({ remoteError, loaderError, detectorError, ownerError }, " / ")
+end
+
+function Guard:GetStatus()
+    return {
+        Running = self.Running,
+        AdonisReady = self.AdonisReady,
+        LoaderReady = self.LoaderReady,
+        RZDONReady = self.RZDONReady,
+        RZDONBlocked = self.RZDONBlocked,
+        DetectorHooks = #self.DetectorHooks,
+        LoaderHooks = #self.LoaderHooks,
+        RemoteHooks = #self.RemoteHooks,
+        UserHooks = #self.UserHooks,
+        StoppedThreads = self.StoppedThreadCount,
+        ParkedCalls = self.ParkedCalls,
+        LoaderParkedCalls = self.LoaderParkedCalls,
+        BlockedRZDONCalls = self.BlockedRZDONCalls,
+        Errors = self.Errors,
+        Events = self.Events,
+        RejoinRequiredForFullRestore = self.StoppedThreadCount > 0
+            or self.ParkedCalls > 0 or self.LoaderParkedCalls > 0,
+    }
+end
+
+rawset(ENV, SLOT, Guard)
+return Guard
