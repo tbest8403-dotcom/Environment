@@ -1,0 +1,405 @@
+-- TweenV2 reusable module: returns the callable TweenV2 function.
+-- Supports require(ModuleScript), or loadstring in a runtime that provides it.
+-- Loading this file does not start a tween. Call the returned function to begin.
+
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+local moduleScript = typeof(script) == "Instance" and script or nil
+
+local activeTargets = setmetatable({}, { __mode = "k" })
+local activeHumanoids = setmetatable({}, { __mode = "k" })
+
+local Easing = {
+	Linear = function(t) return t end,
+	Smooth = function(t) return t * t * (3 - 2 * t) end,
+	Smoother = function(t) return t * t * t * (t * (t * 6 - 15) + 10) end,
+	QuadIn = function(t) return t * t end,
+	QuadOut = function(t) return 1 - (1 - t) ^ 2 end,
+	SineInOut = function(t) return (1 - math.cos(math.pi * t)) / 2 end,
+	BackOut = function(t)
+		local x = t - 1
+		return 1 + 2.70158 * x ^ 3 + 1.70158 * x ^ 2
+	end,
+}
+
+local function finite(x)
+	return type(x) == "number" and x == x and math.abs(x) < math.huge
+end
+
+local function magnitude(x)
+	return type(x) == "number" and math.abs(x) or x.Magnitude
+end
+
+local function validateValue(value)
+	local kind = typeof(value)
+	if kind == "number" then
+		assert(finite(value), "TweenV2: value must be finite")
+	elseif kind == "Vector2" or kind == "Vector3" then
+		assert(finite(value.Magnitude), "TweenV2: vector must be finite")
+	elseif kind == "Color3" then
+		assert(finite(value.R) and finite(value.G) and finite(value.B), "TweenV2: invalid color")
+	elseif kind == "UDim2" then
+		assert(finite(value.X.Scale) and finite(value.X.Offset)
+			and finite(value.Y.Scale) and finite(value.Y.Offset), "TweenV2: invalid UDim2")
+	elseif kind == "CFrame" then
+		for _, component in ipairs({ value:GetComponents() }) do
+			assert(finite(component), "TweenV2: invalid CFrame")
+		end
+	else
+		error("TweenV2: unsupported value type " .. kind)
+	end
+	return kind
+end
+
+local function lerp(a, b, alpha)
+	if type(a) == "number" then return a + (b - a) * alpha end
+	return a:Lerp(b, alpha)
+end
+
+-- Exact damped oscillator solution for a fixed goal during one frame.
+-- Works on numbers, Vector2 and Vector3 without frame-rate-dependent Euler steps.
+local function springStep(x, v, goal, frequency, damping, dt)
+	local w = 2 * math.pi * frequency
+	local y = x - goal
+	if damping < 1 - 1e-5 then
+		local b = w * math.sqrt(1 - damping * damping)
+		local decay = math.exp(-damping * w * dt)
+		local c, s = math.cos(b * dt), math.sin(b * dt)
+		return goal + (y * c + (v + y * (damping * w)) * (s / b)) * decay,
+			(v * c - (v * (damping * w) + y * (w * w)) * (s / b)) * decay
+	elseif damping > 1 + 1e-5 then
+		local q = damping + math.sqrt(damping * damping - 1)
+		local r1, r2 = -w / q, -w * q
+		local c1 = (v - y * r2) / (r1 - r2)
+		local c2 = y - c1
+		local e1, e2 = math.exp(r1 * dt), math.exp(r2 * dt)
+		return goal + c1 * e1 + c2 * e2, c1 * (r1 * e1) + c2 * (r2 * e2)
+	else
+		local decay = math.exp(-w * dt)
+		local c = v + y * w
+		return goal + (y + c * dt) * decay, (v - c * (w * dt)) * decay
+	end
+end
+
+local function safeCallback(callback, ...)
+	if callback then
+		local args = table.pack(...)
+		task.defer(function()
+			local ok, err = pcall(callback, table.unpack(args, 1, args.n))
+			if not ok then warn("TweenV2 callback: " .. tostring(err)) end
+		end)
+	end
+end
+
+local function TweenV2(target, goals, options)
+	assert(typeof(target) == "Instance", "TweenV2: target must be an Instance")
+	local defaults = {
+		Mode = "Spring", -- "Eased", "Spring", or "Force"
+		Duration = 1, Ease = "Smooth", Delay = 0, AutoPlay = true,
+		Frequency = 3, Damping = 0.8, -- Hz; <1 bouncy, 1 critical, >1 overdamped
+		PositionTolerance = 0.01, VelocityTolerance = 0.05, SettleTime = 0.1,
+		Timeout = 10, Hold = false, -- Hold keeps following until Cancel/Destroy
+		GravityScale = 0, MaxForce = 100000, -- Force mode only; 0 gravity = hover
+		StopOnFinish = false, StopOnCancel = false,
+		CancelOnDeath = true,
+	}
+	local allowed = {
+		Owner = true, Humanoid = true, EnterState = true, ExitState = true, AutoRotate = true,
+		DisableStates = true, StateProfiles = true, CancelOnStates = true,
+		VelocityGoal = true, Acceleration = true, InitialVelocity = true,
+		OnUpdate = true, OnComplete = true, OnStateChanged = true,
+	}
+	local o = table.clone(defaults)
+	for key, value in pairs(options or {}) do
+		assert(defaults[key] ~= nil or allowed[key], "TweenV2: unknown option " .. tostring(key))
+		o[key] = value
+	end
+	assert(o.Mode == "Eased" or o.Mode == "Spring" or o.Mode == "Force", "TweenV2: invalid Mode")
+	for _, key in ipairs({ "Duration", "Delay", "PositionTolerance", "VelocityTolerance", "SettleTime", "Timeout", "MaxForce" }) do
+		assert(finite(o[key]) and o[key] >= 0, "TweenV2: " .. key .. " must be finite and >= 0")
+	end
+	local function checkPhysics(profile)
+		assert(finite(profile.Frequency) and profile.Frequency > 0 and profile.Frequency <= 100, "TweenV2: Frequency must be in (0, 100]")
+		assert(finite(profile.Damping) and profile.Damping >= 0 and profile.Damping <= 10, "TweenV2: Damping must be in [0, 10]")
+		assert(finite(profile.GravityScale), "TweenV2: GravityScale must be finite")
+		assert(finite(profile.MaxForce) and profile.MaxForce >= 0, "TweenV2: MaxForce must be >= 0")
+	end
+	checkPhysics(o)
+	local ease = type(o.Ease) == "function" and o.Ease or Easing[o.Ease]
+	assert(type(ease) == "function", "TweenV2: unknown Ease")
+	for _, key in ipairs({ "OnUpdate", "OnComplete", "OnStateChanged" }) do
+		assert(o[key] == nil or type(o[key]) == "function", "TweenV2: " .. key .. " must be a function")
+	end
+	local owner = o.Owner or moduleScript
+	assert(owner == nil or typeof(owner) == "Instance", "TweenV2: Owner must be an Instance")
+	local humanoid = o.Humanoid
+	assert(humanoid == nil or (typeof(humanoid) == "Instance" and humanoid:IsA("Humanoid")), "TweenV2: invalid Humanoid")
+	local profiles = {}
+	for state, override in pairs(o.StateProfiles or {}) do
+		local profile = table.clone(o)
+		for key, value in pairs(override) do
+			assert(key == "Frequency" or key == "Damping" or key == "GravityScale" or key == "MaxForce", "TweenV2: unsupported StateProfiles key " .. tostring(key))
+			profile[key] = value
+		end
+		checkPhysics(profile)
+		profiles[state] = profile
+	end
+	local disableStates = table.clone(o.DisableStates or {})
+	local cancelStates = table.clone(o.CancelOnStates or {})
+	if o.Mode == "Force" then
+		assert(target:IsA("BasePart") and not target.Anchored, "TweenV2: Force needs an unanchored BasePart")
+	end
+	local function read(key)
+		if key == "Pivot" then
+			assert(target:IsA("PVInstance"), "TweenV2: Pivot requires a Model or BasePart")
+			return target:GetPivot()
+		end
+		return target[key]
+	end
+	local function write(key, value)
+		if key == "Pivot" then target:PivotTo(value) else target[key] = value end
+	end
+	local function checkGoals(candidate, existing)
+		assert(type(candidate) == "table" and next(candidate) ~= nil, "TweenV2: goals cannot be empty")
+		local copy = {}
+		for key, goal in pairs(candidate) do
+			assert(type(key) == "string", "TweenV2: goal keys must be property names")
+			if existing then assert(existing[key] ~= nil, "TweenV2: Retarget cannot add properties") end
+			local kind = validateValue(read(key))
+			if o.Mode == "Force" then
+				assert(key == "Position", "TweenV2: Force supports Position only")
+			elseif o.Mode == "Spring" then
+				assert(kind == "number" or kind == "Vector2" or kind == "Vector3", "TweenV2: Spring supports number/Vector2/Vector3; use Eased for CFrame, Color3, UDim2")
+			end
+			if type(goal) ~= "function" then
+				assert(validateValue(goal) == kind, "TweenV2: goal type does not match " .. key)
+			end
+			copy[key] = goal
+		end
+		return copy
+	end
+	local goalMap = checkGoals(goals)
+	local initialVelocity = table.clone(o.InitialVelocity or {})
+	local tracks, connections = {}, {}
+	local force, attachment, oldRotate, oldStates, lastState
+	local elapsed, delayLeft, settled = 0, o.Delay, 0
+	local finished = Instance.new("BindableEvent")
+	local controller = { Status = "Idle", Completed = finished.Event, Elapsed = 0 }
+	local destroyed = false
+
+	local function cleanup(stopVelocity)
+		for _, connection in ipairs(connections) do connection:Disconnect() end
+		table.clear(connections)
+		if force then force:Destroy(); force = nil end
+		if attachment then attachment:Destroy(); attachment = nil end
+		if stopVelocity and o.Mode == "Force" then
+			pcall(function() target.AssemblyLinearVelocity = Vector3.zero end)
+		end
+		if activeTargets[target] == controller then activeTargets[target] = nil end
+		if humanoid and activeHumanoids[humanoid] == controller then
+			activeHumanoids[humanoid] = nil
+			if oldRotate ~= nil then
+				pcall(function()
+					if humanoid.AutoRotate == o.AutoRotate then humanoid.AutoRotate = oldRotate end
+				end)
+			end
+			for state, enabled in pairs(oldStates or {}) do
+				pcall(function()
+					if not humanoid:GetStateEnabled(state) then humanoid:SetStateEnabled(state, enabled) end
+				end)
+			pcall(function()
+				if humanoid.Health > 0 and o.ExitState then humanoid:ChangeState(o.ExitState) end
+			end)
+		end
+	end
+	local function finish(status, detail)
+		if controller.Result then return end
+		controller.Status, controller.Result, controller.Detail = status, status, detail
+		cleanup(status == "Completed" and o.StopOnFinish or status ~= "Completed" and o.StopOnCancel)
+		finished:Fire(status, detail)
+		safeCallback(o.OnComplete, controller, status, detail)
+		-- Completed is one-shot. Await() after completion reads Result immediately.
+		task.defer(function() finished:Destroy() end)
+	end
+	local function resolve(source)
+		if type(source) == "function" then return source(controller, elapsed) end
+		return source
+	end
+	local function stateProfile()
+		if not humanoid then return o end
+		if not humanoid.Parent then finish("Cancelled", "HumanoidRemoved"); return nil end
+		if o.CancelOnDeath and humanoid.Health <= 0 then finish("Cancelled", "Died"); return nil end
+		local state = humanoid:GetState()
+		if state ~= lastState then
+			safeCallback(o.OnStateChanged, controller, lastState, state)
+			lastState = state
+		end
+		if cancelStates[state] then finish("Cancelled", "HumanoidState:" .. state.Name); return nil end
+		return profiles[state] or o
+	end
+	local function step(dt)
+		if controller.Status ~= "Playing" then return end
+		if not target.Parent then finish("Cancelled", "TargetRemoved"); return end
+		local profile = stateProfile()
+		if not profile then return end
+		if delayLeft > 0 then
+			local consumed = math.min(delayLeft, dt)
+			delayLeft = delayLeft - consumed
+			dt = dt - consumed
+			if dt <= 0 then return end
+		end
+		elapsed = elapsed + dt
+		controller.Elapsed = elapsed
+		local allSettled = true
+		local alpha = o.Duration == 0 and 1 or math.min(elapsed / o.Duration, 1)
+		local eased = o.Mode == "Eased" and ease(alpha) or 0
+		if controller.Status ~= "Playing" then return end
+		assert(finite(eased), "TweenV2: Ease returned a non-finite number")
+		for key, track in pairs(tracks) do
+			local goal = resolve(goalMap[key])
+			if controller.Status ~= "Playing" then return end
+			assert(validateValue(goal) == track.Kind, "TweenV2: dynamic goal type changed")
+			if o.Mode == "Eased" then
+				write(key, alpha == 1 and goal or lerp(track.Start, goal, eased))
+				allSettled = alpha == 1
+			elseif o.Mode == "Spring" then
+				track.Value, track.Velocity = springStep(track.Value, track.Velocity, goal, profile.Frequency, profile.Damping, dt)
+				validateValue(track.Value)
+				validateValue(track.Velocity)
+				write(key, track.Value)
+				allSettled = allSettled and magnitude(track.Value - goal) <= o.PositionTolerance
+					and magnitude(track.Velocity) <= o.VelocityTolerance
+			else
+				assert(not target.Anchored, "TweenV2: Force target became anchored")
+				local mass = target.AssemblyMass
+				assert(finite(mass) and mass > 0, "TweenV2: assembly must be unanchored with finite mass")
+				local velocityGoal = resolve(o.VelocityGoal) or Vector3.zero
+				assert(validateValue(velocityGoal) == "Vector3", "TweenV2: VelocityGoal must be Vector3")
+				local delta = goal - target.Position
+				local velocity = target.AssemblyLinearVelocity - velocityGoal
+				local w = 2 * math.pi * profile.Frequency
+				-- Implicit spring-damper acceleration; collisions stay with Roblox's solver.
+				local acceleration = ((delta - velocity * dt) * (w * w) - velocity * (2 * profile.Damping * w))
+					/ (1 + 2 * profile.Damping * w * dt + w * w * dt * dt)
+				local extra = resolve(o.Acceleration) or Vector3.zero
+				if controller.Status ~= "Playing" then return end
+				assert(validateValue(extra) == "Vector3", "TweenV2: Acceleration must be Vector3")
+				local applied = (acceleration + extra + Vector3.new(0, Workspace.Gravity * (1 - profile.GravityScale), 0)) * mass
+				validateValue(applied)
+				if applied.Magnitude > profile.MaxForce then applied = applied.Unit * profile.MaxForce end
+				force.Force = applied
+				allSettled = delta.Magnitude <= o.PositionTolerance and velocity.Magnitude <= o.VelocityTolerance
+			end
+		end
+		settled = allSettled and (settled + dt) or 0
+		safeCallback(o.OnUpdate, controller, dt)
+		if not o.Hold and allSettled and (o.Mode == "Eased" or settled >= o.SettleTime) then
+			finish("Completed")
+		elseif o.Timeout > 0 and elapsed >= o.Timeout then
+			finish("TimedOut", "Timeout")
+		end
+	end
+
+	function controller:Play()
+		assert(not destroyed and not self.Result, "TweenV2: create a new tween after it finishes")
+		if self.Status == "Playing" then return self end
+		if self.Status == "Paused" then self.Status = "Playing"; return self end
+		local ok, err = pcall(function()
+			if humanoid and o.CancelOnDeath and humanoid.Health <= 0 then
+				finish("Cancelled", "Died")
+				return
+			end
+			if activeTargets[target] then activeTargets[target]:Cancel("Replaced") end
+			if humanoid and activeHumanoids[humanoid] then activeHumanoids[humanoid]:Cancel("Replaced") end
+			activeTargets[target] = self
+			for key in pairs(goalMap) do
+				local value = read(key)
+				local kind = validateValue(value)
+				local velocity = nil
+				if o.Mode == "Spring" then
+					velocity = initialVelocity[key] or value * 0
+					assert(validateValue(velocity) == kind, "TweenV2: InitialVelocity type mismatch")
+				end
+				tracks[key] = { Kind = kind, Start = value, Value = value, Velocity = velocity }
+			end
+			if humanoid then
+				activeHumanoids[humanoid] = self
+				oldStates = {}
+				if o.AutoRotate ~= nil then oldRotate = humanoid.AutoRotate; humanoid.AutoRotate = o.AutoRotate end
+				for _, state in ipairs(disableStates) do
+					if oldStates[state] == nil then oldStates[state] = humanoid:GetStateEnabled(state) end
+					humanoid:SetStateEnabled(state, false)
+				end
+				if o.EnterState then
+					assert(humanoid:GetStateEnabled(o.EnterState), "TweenV2: EnterState is disabled")
+					humanoid:ChangeState(o.EnterState)
+				end
+				table.insert(connections, humanoid.Destroying:Connect(function() finish("Cancelled", "HumanoidRemoved") end))
+				if o.CancelOnDeath then table.insert(connections, humanoid.Died:Connect(function() finish("Cancelled", "Died") end)) end
+			end
+			if o.Mode == "Force" then
+				attachment = Instance.new("Attachment")
+				attachment.Name = "TweenV2Attachment"
+				attachment.Parent = target
+				force = Instance.new("VectorForce")
+				force.Name = "TweenV2Force"
+				force.Attachment0 = attachment
+				force.RelativeTo = Enum.ActuatorRelativeTo.World
+				force.ApplyAtCenterOfMass = true
+				force.Force = Vector3.zero
+				force.Parent = target
+			end
+			self.Status = "Playing"
+			table.insert(connections, target.Destroying:Connect(function() finish("Cancelled", "TargetDestroyed") end))
+			if owner then
+				table.insert(connections, owner.Destroying:Connect(function() finish("Cancelled", "OwnerDestroyed") end))
+			end
+			if moduleScript and owner ~= moduleScript then
+				table.insert(connections, moduleScript.Destroying:Connect(function() finish("Cancelled", "ModuleDestroyed") end))
+			end
+			local signal = o.Mode == "Force" and RunService.PreSimulation or RunService.Heartbeat
+			table.insert(connections, signal:Connect(function(dt)
+				local success, message = pcall(step, dt)
+				if not success then finish("Failed", tostring(message)); warn("TweenV2: " .. tostring(message)) end
+			end))
+		end)
+		if not ok then finish("Failed", tostring(err)); error(err, 2) end
+		return self
+	end
+	function controller:Pause()
+		if self.Status == "Playing" then
+			self.Status = "Paused"
+			if force then force.Force = Vector3.zero end
+		end
+		return self
+	end
+	controller.Resume = controller.Play
+	function controller:Cancel(reason)
+		finish("Cancelled", reason or "User")
+		return self
+	end
+	function controller:Retarget(newGoals)
+		assert(not self.Result and not destroyed, "TweenV2: tween has finished")
+		local changes = checkGoals(newGoals, goalMap)
+		for key, value in pairs(changes) do goalMap[key] = value end
+		-- Eased restarts from current values; Spring preserves its current velocity.
+		if o.Mode == "Eased" then
+			for key, track in pairs(tracks) do track.Start = read(key) end
+		end
+		elapsed, self.Elapsed, settled = 0, 0, 0
+		return self
+	end
+	function controller:Await()
+		if self.Result then return self.Result, self.Detail end
+		return self.Completed:Wait()
+	end
+	function controller:Destroy()
+		if destroyed then return end
+		self:Cancel("Destroyed")
+		destroyed = true
+	end
+	if o.AutoPlay then controller:Play() end
+	return controller
+end
+
+return TweenV2
