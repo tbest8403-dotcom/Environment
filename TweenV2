@@ -207,6 +207,7 @@ local function TweenV2(target, goals, options)
 				pcall(function()
 					if not humanoid:GetStateEnabled(state) then humanoid:SetStateEnabled(state, enabled) end
 				end)
+			end
 			pcall(function()
 				if humanoid.Health > 0 and o.ExitState then humanoid:ChangeState(o.ExitState) end
 			end)
